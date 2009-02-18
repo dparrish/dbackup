@@ -1,0 +1,6 @@
+/var/log/dbackup_client {
+    monthly
+    missingok
+    nocompress
+    rotate 12
+}
