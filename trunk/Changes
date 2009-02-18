@@ -1,0 +1,33 @@
+* Mon Apr 23 2007 David Parrish <david-dbackup@dparrish.com>
+- Release 1.2.0
+- Updated documentation for each application
+- Changed the protocol to include flags on a list
+- Added the dry_run flag to restore
+- Some bug fixes and performance enhancements
+
+* Thu Oct 26 2006 David Parrish <david-dbackup@dparrish.com>
+- Release 1.1.0
+- Major rewrite which breaks backward compatibility
+
+* Tue Jun 13 2006 David Parrish <david-dbackup@dparrish.com>
+- Release 1.0.4
+- Put configuration in /etc/dbackup/config
+- Add POD documentation for all tools - Jari Aalto
+
+* Fri May 9 2003 David Parrish <david-dbackup@dparrish.com>
+- Release 1.0.3
+- Specify binmode :raw for all filehandles. Perl 5.8.0 on RH 8/9 uses utf8 by default.
+- Fix localisation problem with df output
+- Include installation note for dbackup_config
+
+* Thu May 8 2003 David Parrish <david-dbackup@dparrish.com>
+- Release 1.0.2
+- First RPM release
+- Add entry to /etc/services
+- Requires xinetd
+- Changed default paths for binaries and config files
+- Made safe_mode not the default in dbackup_archive. Use -s to enable it
+- More stats in dbackup_report
+- dbackup_server copes better with out-of-space errors
+- dbackup_verify is now a 2 stage check. testing, verbose and skip md5 are now options
+- Fix bug with filesystem handling in dbackup_client

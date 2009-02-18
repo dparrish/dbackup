@@ -1,0 +1,211 @@
+#!/usr/bin/perl -w
+# vim:sw=8 ts=8 cindent autoindent
+
+use strict;
+use Digest::MD5;
+use Getopt::Long;
+use POSIX qw( strftime mktime );
+Getopt::Long::Configure("bundling");
+
+my $testing = 0;
+my $verbose = 0;
+my $do_md5 = 1;
+
+show_help() unless GetOptions(
+	'verbose|v' =>		\$verbose,
+	'testing|t' =>		\$testing,
+	'md5!' =>		\$do_md5,
+);
+
+# Initialisation stuff here
+use vars qw( $config );
+for my $conf ("/etc/dbackup/config", "/etc/dbackup_config") {
+	if (-f $conf) {
+		require $conf;
+		last;
+	}
+}
+
+my %backups;
+
+opendir(HOSTS, $config->{backup_root}) or die "Can't open $config->{backup_root}: $!";
+foreach my $host (sort grep !/^\.\.?$/, readdir(HOSTS))
+{
+	print "Checking host $host\n" if $verbose;
+	$backups{$host} = {};
+	opendir(FILES, "$config->{backup_root}/$host") or die "Can't open $config->{backup_root}/$host: $!";
+	foreach my $filename (grep /^([\w\.\-_]+)\.(\d+)\.(\d+)\.(.*)\.meta$/, readdir(FILES))
+	{
+		open(FH, "<$config->{backup_root}/$host/$filename") or
+			print("Can't read $config->{backup_root}/$host/$filename: $!") and next;
+		my %args;
+		while (<FH>)
+		{
+			chomp;
+			my($key, $value) = split /=/;
+			$args{$key} = $value;
+		}
+		close(FH);
+
+		my $data_filename = $filename;
+		$data_filename =~ s/\.meta$/\.data/;
+
+		my $invalid = 0;
+		print "	Checking file $host/$data_filename\n" if $verbose;
+		if (!(open(FH, "<$config->{backup_root}/$host/$data_filename")))
+		{
+			print "		ERROR! Can't open $config->{backup_root}/$host/$data_filename: $!\n";
+			$invalid = 1;
+		}
+		elsif (-s "$config->{backup_root}/$host/$data_filename" != $args{size})
+		{
+			print "		ERROR! Invalid file size\n";
+			$invalid = 1;
+		}
+		else
+		{
+			if ($do_md5)
+			{
+				my $saved_sum = $1;
+				close(FH);
+
+				if (!(open(FH, "<$config->{backup_root}/$host/$data_filename")))
+				{
+					print "		ERROR! Can't open $config->{backup_root}/$host/$data_filename";
+					$invalid = 1;
+				}
+				else
+				{
+					binmode(FH);
+					my $digest = Digest::MD5->new->addfile(*FH)->hexdigest;
+					if ($digest ne $args{md5})
+					{
+						print "		ERROR! Invalid checksum for $config->{backup_root}/$host/$filename ($args{md5} vs $digest)\n";
+						$invalid = 1;
+					}
+					else
+					{
+						print "		Valid checksum for $host/$data_filename\n" if $verbose;
+					}
+				}
+			}
+		}
+		close(FH);
+
+		if ($invalid)
+		{
+			print "		Removing $config->{backup_root}/$host/$filename\n" if $verbose;
+#			unlink("$config->{backup_root}/$host/$filename") unless $testing;
+
+			print "		Removing $config->{backup_root}/$host/$data_filename\n" if $verbose;
+#			unlink("$config->{backup_root}/$host/$data_filename") unless $testing;
+		}
+		else
+		{
+			$data_filename =~ s/\.data$//;
+			$backups{$host}->{$args{dir}}{$args{backup_run}}{$args{level}} = $data_filename;
+		}
+	}
+
+	foreach my $base (keys %{$backups{$host}})
+	{
+		print "	Verifying directory $base\n" if $verbose;
+		my $lastrun = 0;
+		my $lasttime = 0;
+		foreach my $run (sort keys %{$backups{$host}->{$base}})
+		{
+			$lastrun = $run if $run > $lastrun;
+		}
+		print "		Last run is $lastrun\n" if $verbose;
+		foreach my $run (sort keys %{$backups{$host}->{$base}})
+		{
+			print "		Verifying backup run $run\n" if $verbose;
+			my $lastok = 0;
+			my $lastbackup = 0;
+			foreach (sort keys %{$backups{$host}->{$base}{$run}})
+			{
+				$lastbackup = $_ if $_ > $lastbackup;
+				next unless $backups{$host}->{$base}{$run}{$_} =~ /.*(\d\d\d\d)-(\d\d)-(\d\d)-(\d\d)-(\d\d)-(\d\d)/;
+				my $time = mktime($6, $5, $4, $3, $2 - 1, $1 - 1900);
+				$lasttime = $time if $time > $lasttime;
+			}
+			print "		Last backup is $lastbackup\n" if $verbose;
+			my $completerun = 1;
+			for (my $i = 0; $i <= $lastbackup; $i++)
+			{
+				if (!$backups{$host}->{$base}{$run}{$i})
+				{
+					$completerun = 0;
+					print "		WARNING! Backup run $run backup $i doesn't exist!\n" if $verbose;
+				}
+				$lastok = $i if $completerun;
+			}
+			if (!$completerun)
+			{
+				print "		ERROR! Incomplete backup run $host:$base $run!\n";
+				print "		Invalidating files:\n" if $verbose;
+				foreach (sort keys %{$backups{$host}->{$base}{$run}})
+				{
+					next if ($run != $lastrun && $_ <= $lastok);
+					next if ($run == $lastrun && $_ == 0 && !$config->{invalidate_fullbackups});
+					my $fn = $backups{$host}->{$base}{$run}{$_};
+					print "			$host:$fn.data\n" if $verbose;
+					unlink("$config->{backup_root}/$host/$fn.data") unless $testing;
+					print "			$host:$fn.meta\n" if $verbose;
+					unlink("$config->{backup_root}/$host/$fn.meta") unless $testing;
+				}
+
+				if ($run == $lastrun)
+				{
+					$base =~ s/\//./g;
+					$base =~ s/^\.//g;
+					print "		Forcing a full backup next run ($base)\n";
+					do { open(FH, ">$config->{backup_root}/$host/$base.fullbackup") && close(FH) }
+						unless $testing;
+				}
+			}
+		}
+		if ((time - $lasttime) > 5*86400)
+		{
+			printf("      WARNING! Stale backup for $host/$base - newest file is %d days old!\n",
+					(time - $lasttime) / 86400);
+		}
+	}
+}
+closedir(HOSTS);
+
+__END__
+
+=head1 NAME
+
+dbackup_verify - Disk-Based Backup Verify
+
+=head1 SYNOPSIS
+
+dbackup_verify
+
+=head1 DESCRIPTION
+
+This program compares each backup file against the stored checksum. This is
+designed to pick up any errors on the disk before you need to do a restore.
+
+Every backup file will be read from disk in it's entirety when this is run, so
+the server will have a significant increase in disk I/O during this run. 
+
+If a file is found to be corrupt, it is deleted which may cause the entire
+backup run to invalidated. If that is the case, the entire backup run will be
+deleted. If the current backup run is invalidated, a full backup will be forced
+next time dbackup_client is run for that filesystem.
+
+This is meant to be run daily or weekly on the dbackup server by C<cron(8)> or
+similar.
+
+=head1 AUTHOR
+
+David Parrish <david@dparrish.com>
+
+=head1 SEE ALSO
+
+C<dbackup(1)> C<dbackup_server(8)>
+
+=cut
