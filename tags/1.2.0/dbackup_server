@@ -1,0 +1,679 @@
+#!/usr/bin/perl -w
+# vim:sw=8 ts=8 cindent autoindent
+
+use strict;
+use Socket;
+use POSIX qw( isatty strftime );
+use Digest::MD5 qw( md5_hex );
+use Fcntl qw( :flock );
+use IO::Dir;
+use Data::Dumper;
+
+my $extensions = qr/foo$/;
+
+# Initialisation stuff here
+use vars qw( $current_backup_file $config $current_lockfile );
+for my $conf ("/etc/dbackup/config", "/etc/dbackup_config") {
+	if (-f $conf) {
+		debug("INFO reading configuration from $conf");
+		require $conf;
+		last;
+	}
+}
+
+unless ($config->{backup_root}) {
+	debug("FATAL configuration file is missing entry $config->{backup_root}");
+	exit 1;
+}
+
+unless (-d $config->{backup_root} ) {
+	debug("FATAL \$config->{backup_root} dir \"$config->{backup_root}\" does not exist");
+	exit 1;
+}
+
+$config->{logfile} ||= "/var/log/dbackup_server.log";
+$config->{num_incrementals} ||= 20;
+$config->{full_backup_threshold} = 50 unless exists $config->{full_backup_threshold};
+
+if ($config->{stderr_file}) {
+	open(STDERR, ">>$config->{stderr_file}");
+} else {
+	open(STDERR, ">/dev/null");
+}
+my $stdin = \*STDIN; $|=1;
+setsockopt($stdin, SOL_SOCKET, SO_KEEPALIVE, 1);
+binmode($stdin, ':raw');
+my $backup_time = strftime("%Y-%m-%d-%H-%M-%S", localtime(time));
+my $backup_run_number = 0;
+print "NO $0 should only be run by inetd.\n" and exit if isatty($stdin);
+
+$SIG{ALRM} = sub {
+	debug("TIMEOUT sent");
+	sendstr("GOODBYE");
+	unlink($current_backup_file) if $current_backup_file;
+	unlink($current_lockfile) if $current_lockfile;
+	exit;
+};
+$SIG{PIPE} = sub {
+	debug("Client disconnected");
+	unlink($current_backup_file) if $current_backup_file;
+	unlink($current_lockfile) if $current_lockfile;
+	exit;
+};
+$SIG{INT} = $SIG{TERM} = $SIG{QUIT} = sub {
+	debug("Received quit signal");
+	sendstr("GOODBYE");
+	unlink($current_backup_file) if $current_backup_file;
+	unlink($current_lockfile) if $current_lockfile;
+	exit;
+};
+
+# Connection received, say hello
+my($remote_port, $iaddr) = sockaddr_in(getpeername($stdin));
+my $remote_hostname = gethostbyaddr($iaddr, AF_INET) || inet_ntoa($iaddr);
+$remote_hostname =~ s/$config->{domain_name_strip}//g if $config->{domain_name_strip};
+my $remote_ip = inet_ntoa($iaddr);
+
+$0 = "dbackup_server - $remote_hostname";
+
+# Per-server configuration
+debug("Reading host config file") and require "$config->{backup_root}/$remote_hostname/dbackup_config"
+	if -f "$config->{backup_root}/$remote_hostname/dbackup_config";
+
+sendstr("NO Invalid IP address") and exit unless check_ip_allow();
+
+debug("Connection received from $remote_ip");
+
+my $oldfd = select(STDOUT); $|=1; select($oldfd);
+sendstr("HELLO $remote_hostname");
+
+
+READCMD: while ($_ = getstr()) {
+	debug("Received command $_");
+	if (/^BYE$/)
+	{
+		$SIG{PIPE} = 'IGNORE';
+		last;
+	}
+	if (/^BACKUP ([^ ]+)(.*)$/) {
+		my($remote_dir, $args) = ($1, $2);
+		$remote_dir = "/" if $remote_dir eq '.';
+		$remote_dir =~ s/\/$// unless $remote_dir eq '/';
+		my $dir = convert_dir($remote_dir);
+
+		my %args;
+		foreach (split / /, $args)
+		{
+			my($key, $value) = split /=/;
+			$args{$key} = $value if $key;
+		}
+
+		if (! -d "$config->{backup_root}/$remote_hostname") {
+			mkdir "$config->{backup_root}/$remote_hostname", 0755
+				or sendstr("NO Error creating host dir: $!") and return;
+		}
+
+		sendstr("NO Backup in progress") and next READCMD unless lock_backup($remote_hostname, $dir);
+
+		my($last_backup, $next_level) = get_last_info($remote_hostname, $dir);
+		if ($last_backup)
+		{
+			debug("Last backup was at ". strftime("%Y-%m-%d %H:%M:%S", localtime($last_backup)));
+			debug("Going to do a level $next_level backup");
+		}
+		else
+		{
+			debug("This is the first backup");
+		}
+
+		$current_backup_file = "$config->{backup_root}/$remote_hostname/$dir.$backup_run_number.$next_level.${backup_time}";
+		
+		$config->{compress} = "0" unless exists $config->{compress};
+
+		open(OUT, ">$current_backup_file.data") or sendstr("NO Can't write backup file: $!") and next;
+		binmode(OUT, ':raw');
+
+		debug("Writing to backup file $current_backup_file");
+
+		sendstr("OK last=$last_backup level=$next_level compress=$config->{compress}");
+		my $start_time = time;
+
+		$SIG{PIPE} = 'IGNORE';
+
+		my $total = 0;
+		my $error;
+		my $md5 = new Digest::MD5;
+		while (1) {
+			my $buffer = getstr();
+			last if length($buffer) == 0;
+			syswrite(OUT, $buffer, length $buffer)
+				or sendstr("NO Error writing backup data: $!") and $error = $! and last;
+			$md5->add($buffer);
+			$total += length $buffer;
+		}
+		close(OUT);
+		unlock_backup($remote_hostname, $dir);
+
+		if ($error)
+		{
+			debug("Error writing backup data: $error");
+			unlink("$current_backup_file.data");
+			next;
+		}
+
+		debug("Wrote $total bytes for $remote_dir");
+
+		my $end_time = time;
+		my $digest = $md5->hexdigest;
+		my $meta_file = "$current_backup_file.meta";
+		if (open(FH, ">$meta_file")) {
+			print FH "start_time=$start_time\n";
+			print FH "end_time=$end_time\n";
+			print FH "duration=". ($end_time - $start_time). "\n";
+			print FH "dir=/$remote_dir\n";
+			print FH "backup_run=$backup_run_number\n";
+			print FH "level=$next_level\n";
+			print FH "compress=$config->{compress}\n";
+			print FH "size=$total\n";
+			print FH "md5=$digest\n";
+			print FH "source_ip=$remote_ip\n";
+			print FH "encrypt=$args{encrypt}\n" if $args{encrypt};
+			close(FH);
+
+			sendstr("OK $total ". $digest);
+			if ($total == 0 || ($_ = getstr()) !~ /^OK/) {
+				debug("Client said \"$_\", removing backup file");
+				unlink("$current_backup_file.data");
+				unlink("$current_backup_file.meta");
+				$current_backup_file = undef;
+			}
+		}
+		else
+		{
+			debug("Error writing meta file: $!");
+			sendstr("NO Backup incomplete: $!");
+			$_ = getstr();
+			unlink("$current_backup_file.data");
+			unlink("$current_backup_file.meta");
+		}
+
+		$current_backup_file = undef;
+		check_next_fullbackup($remote_hostname, $dir);
+	} elsif (/^LIST (\S+) (\S+)$/) {
+		# List command
+		my($hostname, $directory) = ($1, $2);
+		$directory =~ s/\/$// unless $directory eq '/';
+
+		if ($config->{full_incremental}) {
+			sendstr("full_incremental");
+		} else {
+			sendstr("daily_incremental");
+		}
+
+		my %dir;
+		if (tie %dir, 'IO::Dir', "$config->{backup_root}/$hostname")
+		{
+			foreach (grep /^([\w\.]+)\.(\d+)\.(\d+)\..*\.meta$/, sort keys %dir)
+			{
+				my %args;
+				open(FH, "<$config->{backup_root}/$hostname/$_") or debug("Can't read $config->{backup_root}/$hostname/$_: $!") and next;
+				while (<FH>)
+				{
+					chomp;
+					my($key, $value) = split /=/;
+					$args{$key} = $value;
+				}
+				close(FH);
+				next if $directory ne '?' && $args{dir} !~ /^\/?$directory\/?$/;
+				sendstr("$args{dir} $args{backup_run} $args{level} $args{start_time} $args{size}");
+			}
+
+			sendstr("END");
+		}
+		else
+		{
+			sendstr("NO Can't open $config->{backup_root}/$hostname: $!");
+		}
+	} elsif (/^RESTORE ([\w\._-]+) (\S+) (\d+) (\d+) (\w+)$/) {
+		my($hostname, $directory, $run, $level, $auth_key) = ($1, $2, $3, $4, $5);
+		$directory =~ s/\/$// unless $directory eq '/';
+		sendstr("NO Invalid authorization key") and debug("Invalid auth key for restore") and next READCMD
+			if ($config->{auth_key} && ($auth_key ne $config->{auth_key}));
+		sendstr("NO Can't find any backups for $hostname") and next READCMD
+			unless opendir(DIR, "$config->{backup_root}/$hostname");
+		my $dir = convert_dir($directory);
+
+		my($backup_file, %dir, $compression, $encryption);
+		tie %dir, 'IO::Dir', "$config->{backup_root}/$hostname";
+
+		foreach my $filename (grep /^([\w\.\-_]+)\.(\d+)\.(\d+)\..*\.meta$/, sort keys %dir)
+		{
+			my %args;
+			open(FH, "<$config->{backup_root}/$hostname/$filename")
+				or debug("Can't read $config->{backup_root}/$hostname/$filename: $!")
+				and next;
+			while (<FH>)
+			{
+				chomp;
+				my($key, $value) = split /=/;
+				$args{$key} = $value;
+			}
+			close(FH);
+			next unless $directory eq $args{dir};
+			next unless $level eq $args{level};
+			next unless $run eq $args{backup_run};
+
+			$backup_file = $filename;
+			$backup_file =~ s/\.meta$/.data/;
+			$compression = $args{compress};
+			$encryption = $args{encrypt};
+			last;
+		}
+		untie %dir;
+
+		sendstr("NO Can't find $dir.$run.$level for $hostname") and next READCMD unless $backup_file;
+
+		open(FH, "<$config->{backup_root}/$hostname/$backup_file")
+			or sendstr("NO Can't read backup file: $!") and next READCMD;
+
+		debug("Sending backup file $hostname:$backup_file to $remote_ip");
+		my $message = "OK $backup_file compress=$compression";
+		$message .= " encrypt=$encryption" if $encryption;
+		sendstr($message);
+		my $buffer;
+		my $total = 0;
+		my $md5 = new Digest::MD5;
+		while (my $n = sysread(FH, $buffer, 256*1024)) {
+			sendstr($buffer);
+			$total += $n;
+			$md5->add($buffer);
+		}
+		sendstr("");
+		$_ = getstr();
+		my $digest = $md5->hexdigest;
+		if (/^OK (\d+) (\w+)$/) {
+			if ($1 != $total) {
+				debug("Data transfer error. Server only received $1 of $total bytes\n");
+				sendstr("NO Incorrect total");
+			} elsif ($2 ne $digest) {
+				debug("Data transfer error. Checksum does not match on client end\n");
+				sendstr("NO Invalid checksum");
+			} else {
+				debug("File $hostname:$directory sent successfully to $remote_ip ($total bytes)\n");
+				sendstr("OK");
+			}
+		} else {
+			debug("Received invalid response: $_\n");
+			sendstr("NO");
+		}
+		close(FH);
+	} else {
+		sendstr("NO Invalid command");
+	}
+}
+
+sendstr("GOODBYE");
+debug("Connection closed\n");
+exit;
+
+sub debug {
+	return unless $config->{verbose};
+	open(LOG, ">>$config->{logfile}") || return undef;
+	flock(LOG, LOCK_EX);
+	seek(LOG, 0, 2);
+	while (my $message = shift) {
+		printf(LOG "%s %s:%d %s%s",
+			strftime("%Y-%m-%d %H:%M:%S", localtime(time)),
+			$remote_hostname || "none",
+			$remote_port || 0,
+			$message,
+			($message =~ /\n$/) ? "" : "\n");
+	}
+	close(LOG);
+	return 1;
+}
+
+sub sendstr {
+	my($str) = @_;
+	my $tmp = pack("N", length($str));
+	syswrite(STDOUT, $tmp, 4);
+	syswrite(STDOUT, $str, length($str));
+}
+
+sub getstr {
+	my $tmp;
+	my $str;
+	doread($stdin, \$tmp, 4);
+	doread($stdin, \$str, unpack("N", $tmp));
+	return $str;
+}
+
+sub get_last_info {
+	my($remote_hostname, $path) = @_;
+
+	my($next_level, $last_backup) = (0, 0);
+	$backup_run_number = 0;
+
+	my %dir;
+	return ($last_backup, $next_level) unless
+		tie %dir, 'IO::Dir', "$config->{backup_root}/$remote_hostname";
+
+	foreach (grep /^$path\.(\d+)\.(\d+)\..*\.meta$/, sort keys %dir)
+	{
+		my %args;
+		open(FH, "<$config->{backup_root}/$remote_hostname/$_") or debug("Can't read $config->{backup_root}/$remote_hostname/$_: $!") and next;
+		while (<FH>)
+		{
+			chomp;
+			my($key, $value) = split /=/;
+			$args{$key} = $value;
+		}
+		close(FH);
+		$next_level = $args{level};
+		$backup_run_number = $args{backup_run}
+			if $args{backup_run} > $backup_run_number;
+		if ($config->{full_incremental}) {
+			$last_backup = $args{start_time} if $args{level} == 0;
+		} else {
+			$last_backup = $args{start_time};
+		}
+	}
+
+	$next_level++ if $last_backup;
+	$next_level = 0 if $next_level >= $config->{num_incrementals} || $last_backup == 0;
+	unlink("$config->{backup_root}/$remote_hostname/$path.fullbackup") and
+		debug("Forced full backup for $path") and $next_level = 0
+		if -f "$config->{backup_root}/$remote_hostname/$path.fullbackup";
+	$backup_run_number++ if $next_level == 0;
+	return ($last_backup, $next_level);
+}
+
+sub doread {
+	my($socket, $buffer, $size) = @_;
+	my $r = 0;
+	while (my $b = sysread($socket, $$buffer, $size - $r, $r)) {
+		$r += $b;
+		return $r if ($r >= $size);
+	}
+}
+
+sub check_ip_allow {
+	return 1 unless $config->{ip_allow} && scalar @{$config->{ip_allow}};
+	my $address = inet_ntoa($iaddr);
+	foreach (@{$config->{ip_allow}}) {
+		return 1 if $address =~ /^$_/;
+	}
+	return 0;
+}
+
+sub convert_dir {
+	$_ = shift;
+	return "" if /^$/;
+	s/\/$//;
+	s/\//./g;
+	s/^\.//;
+	return "_root_" if $_ eq '';
+	return $_;
+}
+
+sub check_next_fullbackup {
+	my($remote_hostname, $path) = @_;
+	return unless opendir(DIR, "$config->{backup_root}/$remote_hostname");
+	my @files = sort(grep(/^$path\./, grep(!/^\.\.?$/, readdir(DIR))));
+	closedir(DIR);
+	my $last_backup = pop(@files);
+	return unless $last_backup =~ /(\d+)\.(\d+)\.(\d+-\d+)\.$extensions$/;
+	return if ($2 == 0); # This is a full backup
+	my $last_backup_size = -s "$config->{backup_root}/$remote_hostname/$last_backup";
+	return unless $last_backup_size;
+
+	while (my $file = pop(@files)) {
+		next unless $file =~ /(\d+)\.(\d+)\.(\d+-\d+)\.$extensions$/;
+		next unless ($2 == 0); # Look for a full backup
+		my $size = -s "$config->{backup_root}/$remote_hostname/$file";
+		return if (!$size || $size == 10240); # Empty tar file
+		my $percentage = ($last_backup_size / $size) * 100;
+		if ($config->{full_backup_threshold} && $percentage >= $config->{full_backup_threshold}) {
+			debug(sprintf("This backup is %0.0f%% of the full backup. Forcing a full backup next run", $percentage));
+			open(FH, ">$config->{backup_root}/$remote_hostname/$path.fullbackup");
+			close(FH);
+		}
+		return;
+	}
+
+}
+
+sub lock_backup {
+	my($remote_hostname, $dir) = @_;
+	my $lockfile = "$config->{backup_root}/$remote_hostname/$dir.lock";
+	if (-f $lockfile) {
+		open(FH, "<$lockfile");
+		my $pid = <FH>;
+		chomp $pid;
+		close(FH);
+		if (kill 0, $pid) {
+			return 0;
+		}
+	}
+	open(FH, ">$lockfile") and print FH "$$\n" and close(FH);
+	$current_lockfile = $lockfile;
+	return 1;
+}
+
+sub unlock_backup {
+	my($remote_hostname, $dir) = @_;
+	unlink("$config->{backup_root}/$remote_hostname/$dir.lock");
+	$current_lockfile = undef;
+}
+
+__END__
+
+=head1 NAME
+
+dbackup_server - Disk-Based Backup Server
+
+=head1 SYNOPSIS
+
+The servers is designed to be run by inetd. You should include a line in
+/etc/inetd that looks like:
+
+38771		stream	tcp	nowait	root	/usr/sbin/dbackup_server
+
+=head1 DESCRIPTION
+
+This is the backup server for the dbackup software. It is designed to run from
+inetd only, and running from the command prompt will give an error.
+
+The server is designed to handle all the smarts and maintain all state on the
+backups, whereas the client is supposed to be minimal. This aids a lot in the
+case of a complete system failure and needing to recover everything.
+
+The client-server protocol is described in the B<PROTOCOL> section.
+
+=head1 PROTOCOL
+
+The client connects to the server on port 38771. Messages are passed between
+client and server as:
+
+ -------------------------------------------------------------------------
+ | 1 2 3 4 5 6 7 8 | 1 2 3 4 5 6 7 8 | 1 2 3 4 5 6 7 8 | 1 2 3 4 5 6 7 8 |
+ -------------------------------------------------------------------------
+ | size of message body (unsigned long, network order)                   |
+ -------------------------------------------------------------------------
+ | message body... (variable length)                                     |
+ -------------------------------------------------------------------------
+
+The message itself is in plain text.
+
+Messages the clients sends to the server are:
+
+=over 4
+
+=item B<BACKUP> directory
+
+Request a backup be performed for B<directory>. The server will either respond
+with B<NO message> if the backup can't be performed or B<OK last_backup
+backup_level> if the backup may proceed. B<last_backup> is the UNIX timestamp
+of the last time a backup was performed on this directory. B<backup_level> is
+an arbitrary number, where 0 means a full backup and 1 is an incremental since
+the last full backup.
+
+After an OK, the client should begin streaming a B<GNU tar> style file to the
+server in blocks. The size of the block should preceed the data, just as the
+message format.
+
+At the end of the file, the client must send a 0 sized block to indicate the
+file is finished. The server will respond with B<NO message> if the file write
+did not succeed, or B<OK size md5> if the write was OK.
+
+The client must then check the size and md5 sum of the data written against
+what the server sends. If it is ok, the client will send B<OK>, otherwise B<NO
+message>.
+
+=item B<LIST> hostname directory
+
+The client is requesting a list of backups available for B<directory> on
+B<hostname>.
+
+The server should respond with B<OK> if a list is available (even if an empty
+one), or B<NO message> if there is an error.
+
+After an B<OK>, the server should send a message for each backup available,
+containing:
+
+ backup_run backup_level backup_time size_in_bytes
+
+Followed by B<END> at the end of the list.
+
+=item B<RESTORE> hostname directory backup_run backup_level auth_key
+
+Request a directory to be restored from the server. It's generally advisable to
+list the available backups first with the LIST command (see B<dbackup_restore>).
+
+If an auth_key is configured in the server, the client must provide the same
+auth key to receive the backup, otherwise the client must send B<none> as the
+auth_key.
+
+If the server can send the file, an B<OK> message is sent, followed by blocks
+of data in the same format as the backup stream. If the server cannot provide
+the backup, a B<NO message> is sent.
+
+At the end of the file, the server must send a 0 sized block to indicate the
+file is finished. The client will respond with B<NO message> if the file write
+did not succeed, or B<OK size md5> if the write was OK.
+
+The server must then check the size and md5 sum of the data written against
+what the client sends. If it is ok, the server will send B<OK>, otherwise B<NO
+message>.
+
+=back
+
+=head1 CONFIGURATION
+
+Global configuration is in I</etc/dbackup/config>. This file is a perl script
+containing the $config hash.
+
+A per-client configuration file can be created under the backup root, called
+dbackup_config. This file should only contain options that are different to the
+global config.
+
+Configuration options available are
+
+=over 4
+
+=item B<backup_root>
+
+This is the root directory where host directories will be created and backups
+stored.
+
+=item B<stderr_file>
+
+Any messages to STDERR will be printed to this file. Generally not needed
+unless debugging. By default this is set to C</dev/null>.
+
+=item B<num_incrementals>
+
+The number of incremental backups that will be stored between full backups.
+This is most useful on a per-client basis.
+
+=item B<archive_days>
+
+The number of days that backup runs will stay around before being moved off to
+tape. Make sure this is <= delete_days or you will lose the backups. If set to
+0, backups will not be archived to tape.
+
+Backup runs are archived in one go. When the last incremental backup is older
+than archive_days, then the entire run is archived.
+
+=item B<delete_days>
+
+The number of days that backup runs will stay around before being deleted. If
+this is less than archive_days, then the backup files will be deleted before
+they have a chance to be archived. Set this to 0 to disable deletion of
+backups. Beware that this will make your backup directory constantly increase
+in size.
+
+Backup runs are deleted in one go. When the last incremental backup is older
+than delete_days, then the entire run is deleted.
+
+=item B<compress>
+
+If set to 'gzip' or '1', backups will be compressed with gzip on the server. If
+set to 'bzip2', backups will be compressed with bzip2. This does not affect the
+client at all, as the backup will be compressed on the fly on the server side.
+
+=item B<ip_allow>
+
+A arrayref containing a list of regexes to check the source IP address against.
+If the client's IP address does not match any of these addresses (and the list
+is not empty), then backups / restores will be denied.
+
+=item B<auth_key>
+
+If set, clients must provide this key to restore a backup.
+
+=item B<dbackup_threshold>
+
+Whenever an incremental backup is performed, the size of the backup is checked
+against the size of the last full backup. If the incremental is greater than
+B<dbackup_threshold>% the size of the last full backup, then a full backup will
+be forced next run. This is to stop clients constantly sending large
+incremental backups. Default is 50%.
+
+=back
+
+=head1 FILES
+
+=over 4
+
+=item B</var/log/dbackup_server.log>
+
+The server log
+
+=item B</etc/dbackup/config>
+
+Host specific configuration file. See section I<CONFIGURATION>.
+
+=item B</home/dbackup/dumps>
+
+This is the default location for backups to be stored, under a directory for
+the hostname of the client.
+
+=back
+
+=head1 NOTES
+
+The server maintains state on what backups will be performed next. If a file
+called "fullbackup" exists in a client dir, the a full backup will be forced
+next time the client connects.
+
+=head1 AUTHOR
+
+David Parrish <david@dparrish.com>
+
+=head1 SEE ALSO
+
+C<dbackup(1)>
+
+=cut
+

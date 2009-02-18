@@ -1,0 +1,12 @@
+# default: on
+# description: dbackup is a disk-based backup server
+service dbackup
+{
+        socket_type             = stream
+        wait                    = no
+        user                    = root
+        log_on_success          += USERID
+        log_on_failure          += USERID
+        server                  = /usr/sbin/dbackup_server
+        disable                 = no
+}

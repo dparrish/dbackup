@@ -1,0 +1,841 @@
+#!/usr/bin/perl -w
+# vim:sw=8 ts=8 cindent autoindent
+
+use strict;
+use IO::Socket::INET;
+use POSIX qw( strftime tmpnam );
+use Sys::Hostname;
+use Digest::MD5 qw( md5_hex );
+use Getopt::Long;
+Getopt::Long::Configure("bundling");
+
+use vars qw( $backup_port $backup_servers );
+$backup_port = 38771;
+$backup_servers = [ "localhost" ];
+require '/etc/dbackup-client/config' if -f '/etc/dbackup-client/config';
+
+my $verbose = 0;
+my $hostname = hostname;
+my $perfectbackup = 1;
+my $backup_errors = "";
+my $program_start = time;
+my $progress;
+my $last_backup_file = "/var/state/dbackup/dbackup_last_server";
+
+$|=1;
+my $mode = shift @ARGV;
+show_help() unless $mode;
+
+sub verbose($);
+sub message($);
+sub error($);
+
+if ($mode eq 'list') #{{{
+{
+	# List available backups
+	my $backup_server;
+
+	show_help() unless GetOptions(
+		'verbose|v' =>			\$verbose,
+		'help|?' =>			sub { show_help() },
+		'hostname|h=s' =>		\$hostname,
+		'server|s=s' =>			\$backup_server,
+	);
+
+	my @restore_dirs = @ARGV;
+
+	unless ($backup_server) {
+		$backup_server = $backup_servers->[0];
+		if (-f $last_backup_file) {
+			open(FH, "<$last_backup_file");
+			$backup_server = <FH>;
+			close(FH);
+			chomp($backup_server);
+		}
+	}
+
+	@restore_dirs = ( '?' ) unless scalar @restore_dirs;
+
+	verbose "Connecting to backup host $backup_server:$backup_port\n";
+	my $socket = new IO::Socket::INET
+			PeerAddr => $backup_server,
+			PeerPort => $backup_port,
+			Proto => 'tcp' or die "Can't connect to $backup_server:$backup_port: $!";
+	binmode($socket, ':raw');
+
+	die "Can't connect: $!" unless $socket;
+	die "Not a dbackup server" unless getstr($socket) =~ /^HELLO .*/;
+
+	RESTOREDIR: foreach my $restore_dir (@restore_dirs) {
+		verbose "--> LIST $hostname $restore_dir\n";
+		sendstr($socket, "LIST $hostname $restore_dir");
+		my $response = getstr($socket);
+		verbose "<-- $response\n";
+
+		if ($restore_dir eq '?') {
+			message "Available backups for $hostname:\n"
+		} else {
+			message "Available backups for $restore_dir for $hostname:\n";
+		}
+
+		my @backups;
+		my $maxdirlen = 0;
+		while (defined(my $response = getstr($socket)))
+		{
+			verbose "<-- $response\n";
+			if ($response =~ /^NO .* No such file or directory/)
+			{
+				error("Server does not have any backups for $hostname\n");
+				exit 3;
+			}
+			message "Server responded with an error:\n   $response\n" and exit
+				if ($response =~ /^NO/);
+			last if $response eq 'END';
+
+			my %r;
+			if (($r{dir}, $r{run}, $r{level}, $r{time}, $r{size}, $r{flags}) = $response =~ /^(\S+) (\d+) (\d+) (\d+) (\d+) (.*)$/) {
+				push @backups, {%r};
+				$maxdirlen = length $r{dir} if length $r{dir} > $maxdirlen;
+			} else {
+				message "$response\n";
+			}
+		}
+
+		message("Max dir length: $maxdirlen\n");
+		message sprintf("\n%-*s %5s %5s %-16s %13s   %9s %-5s\n",
+				$maxdirlen, "Directory", "Run", "Level", "Date", "Size", "", "Flags");
+		foreach my $r (@backups)
+		{
+			message sprintf("%-*s %5s %5s %-16s %13s (%9s) %5s\n",
+					$maxdirlen, $r->{dir}, $r->{run}, $r->{level},
+					strftime("%Y-%m-%d %H:%M", localtime($r->{time})),
+					$r->{size}, nice_size($r->{size}), $r->{flags})
+		}
+
+		message "No backups available for $restore_dir on $hostname\n"
+			unless @backups;
+
+		message "\n";
+	}
+
+	verbose "--> BYE\n";
+	sendstr($socket, "BYE");
+	print "\n";
+	exit 0;
+}
+#}}}
+elsif ($mode eq 'restore') #{{{
+{
+	# Restore
+	my $output_root = "./";
+	my $skip_level0 = 0;
+	my $auth_key = "";
+	my $backup_server;
+	my $force_backup_run = "";
+	my $dry_run = 0;
+
+	show_help() unless GetOptions(
+		'verbose|v' =>			\$verbose,
+		'help|?' =>			sub { show_help() },
+		'hostname|h=s' =>		sub {
+							$hostname = $_[1];
+							message "Forcing hostname $hostname\n";
+						},
+		'root|d=s' =>			\$output_root,
+		'server|s=s' =>			\$backup_server,
+		'auth|a=s' =>			\$auth_key,
+		'dry_run|t' =>			\$dry_run,
+		'force_backup_run|b=s' =>	\$force_backup_run,
+		'skip_level0|0' =>		\$skip_level0,
+	);
+
+	my @restore_dirs = @ARGV;
+
+	unless ($backup_server) {
+		$backup_server = $backup_servers->[0];
+		if (-f $last_backup_file) {
+			open(FH, "<$last_backup_file");
+			$backup_server = <FH>;
+			close(FH);
+			chomp($backup_server);
+		}
+	}
+
+	unless (scalar @restore_dirs) {
+		error "You must specify at least one directory to restore\n";
+		exit 2;
+	}
+
+	verbose "Connecting to backup host $backup_server:$backup_port\n";
+	my $socket = new IO::Socket::INET
+			PeerAddr => $backup_server,
+			PeerPort => $backup_port,
+			Proto => 'tcp' or die "Can't connect to $backup_server:$backup_port: $!";
+	binmode($socket, ':raw');
+
+	die "Can't connect: $!" unless $socket;
+	die "Not a dbackup server" unless getstr($socket) =~ /^HELLO .*/;
+
+	unless ($dry_run)
+	{
+		verbose "Output will go to $output_root\n";
+		mkdir($output_root, 0755) or die "Can't create $output_root: $!" unless (-d $output_root);
+		chdir($output_root) or die "Can't chdir to $output_root: $!";
+	}
+
+	RESTOREDIR: foreach my $restore_dir (@restore_dirs) {
+		my($backup_run, $backup_level);
+		my @available_backups;
+		my $full_incremental;
+
+		eval {
+			require Term::ProgressBar;
+			$progress = new Term::ProgressBar {
+				count => 5000,
+				ETA => 'linear',
+			};
+			$progress->max_update_rate(2);
+		};
+		$progress = undef if $@;
+
+		my @restore_levels;
+		my $restore_total_bytes = 0;
+
+		if ($force_backup_run) {
+			($backup_run, $backup_level) = split(/\./, $force_backup_run, 2);
+			push @restore_levels, $backup_level;
+		} else {
+			message "Finding a backup for $restore_dir\n";
+			verbose "--> LIST $hostname $restore_dir\n";
+			sendstr($socket, "LIST $hostname $restore_dir");
+			my $response = getstr($socket);
+			verbose "<-- $response\n";
+			if ($response eq 'full_incremental') {
+				verbose "Server does full incrementals.\n";
+				$full_incremental = 1;
+			} else {
+				verbose "Server does daily incrementals.\n";
+				$full_incremental = 0;
+			}
+			while (my $response = getstr($socket)) {
+				verbose "<-- $response\n";
+				if ($response =~ /^NO .* No such file or directory/)
+				{
+					error("Server does not have any backups for $hostname\n");
+					next RESTOREDIR;
+				}
+				message "Server responded with an error:\n   $response\n" and exit
+					if ($response =~ /^NO/);
+				last if $response eq 'END';
+				push @available_backups, $response;
+			}
+
+			message "No backups available for $restore_dir from $hostname\n" and next
+				unless scalar @available_backups;
+
+			push @restore_levels, 0 unless $skip_level0;
+			my $backup_time = 0;
+			$backup_run = 0;
+			foreach (@available_backups) {
+				next unless /^\S+ (\d+) (\d+) (\d+) (\d+) (.*)$/;
+				$backup_run = $1 if ($1 > $backup_run);
+			}
+			if (!$backup_run)
+			{
+				error "Can't find a valid backup run for $restore_dir\n";
+				next RESTOREDIR;
+			}
+			verbose "Latest backup run is $backup_run\n";
+
+			foreach (@available_backups) {
+				next unless /^\S+ (\d+) (\d+) (\d+) (\d+) (.*)$/;
+				next unless ($backup_run == $1);
+				$backup_level = $2 if $backup_time < $3;
+				my $time = strftime("%Y-%m-%d %H:%M:%S", localtime($3));
+				verbose "Backup taken at $time (Backup $backup_run.$backup_level)\n";
+				if (!$full_incremental) {
+					# Need to restore each incremental until the latest
+					if ($backup_level > 0)
+					{
+						push @restore_levels, $backup_level;
+					}
+				}
+				$restore_total_bytes += $4;
+			}
+			if ($full_incremental) {
+				push @restore_levels, $backup_level if $backup_level > 0;
+			}
+			@restore_levels = sort { $a <=> $b } @restore_levels;
+		}
+
+		error "Can't find a backup to restore for $restore_dir from $hostname\n" and next
+			if $backup_run < 0;
+
+		$progress->target($restore_total_bytes) if $progress;
+		my $bytes_restored = 0;
+		my $start_time = time;
+
+		foreach my $level (@restore_levels) {
+			message "Restoring $restore_dir on $hostname to $output_root (Backup $backup_run.$level)\n";
+
+			$auth_key ||= "none";
+			verbose "--> RESTORE $hostname $restore_dir $backup_run $level $auth_key\n";
+			sendstr($socket, "RESTORE $hostname $restore_dir $backup_run $level $auth_key");
+			my $message = getstr($socket);
+			verbose "<-- $message\n";
+			if ($message !~ /^OK (\S+) (.*)/) {
+				error "Backup server won't give me that backup: $message\n\n";
+				exit;
+			}
+			my %args;
+			foreach (split / /, $2)
+			{
+				my($key, $value) = split /=/;
+				$args{$key} = $value;
+			}
+			verbose "Receiving backup\n";
+
+			if ($dry_run)
+			{
+				message "This is a dry run, no output will be created\n";
+			}
+			else
+			{
+				my $cmdline;
+				$cmdline .= "gpg -d |" if $args{encrypt};
+				$cmdline .= "gzip -dc |" if $args{compress} eq 'gzip';
+				$cmdline .= "bzip2 -dc |" if $args{compress} eq 'bzip2';
+				$cmdline .= "tar -G -p -x -f -";
+				verbose "Piping output to $cmdline\n";
+				open(TAR, "|$cmdline") or die "Can't run $cmdline: $!";
+				binmode(TAR, ':raw');
+			}
+
+			my $total = 0;
+			my $md5 = new Digest::MD5;
+			while (1) {
+				alarm(300);
+				my $buffer = getstr($socket);
+				last if !$buffer || length $buffer == 0;
+				syswrite(TAR, $buffer, length $buffer) unless $dry_run;
+				$md5->add($buffer);
+				$total += length $buffer;
+				$bytes_restored += length $buffer;
+				$progress->update($bytes_restored) if $progress;
+			}
+			my $digest = $md5->hexdigest;
+			verbose "--> OK $total $digest\n";
+			sendstr($socket, "OK $total $digest");
+			$_ = getstr($socket);
+			verbose "<-- $_\n";
+			if (!/^OK/) {
+				message "Data transfer error: $_\n";
+				message "Restored files may not be intact.\n";
+				next RESTOREDIR;
+			}
+			close(TAR) unless $dry_run;
+		}
+
+		my $time_taken = (time - $start_time) || 1;
+		message sprintf("Restored %0.0fKb in %d seconds (%0.1fKb/s).\n",
+			($bytes_restored / 1024), $time_taken, (($bytes_restored / 1024) / $time_taken));
+	}
+
+	verbose "--> BYE\n";
+	sendstr($socket, "BYE");
+	print "\n";
+	exit 0;
+}
+#}}}
+elsif ($mode eq 'backup') #{{{
+{
+	# Backup mode
+
+	my($encrypt, $report);
+	die "Invalid usage" unless GetOptions(
+		'verbose|v' =>		\$verbose,
+		'report|r' =>		\$report,
+		'encrypt|e=s' =>	\$encrypt,
+		'help|?' =>		sub { show_help() },
+	);
+
+	my @filesystems = grep /^\//, @ARGV;
+	die "No directories to back up on command line" unless @filesystems;
+
+	my $total_bytes = 0;
+
+	$SIG{PIPE} = sub
+{
+		error("SIGPIPE received.");
+		print <<EOF;
+Errors occurrecd during backup:
+
+$backup_errors
+
+-- 
+$0
+EOF
+		exit 1;
+	};
+
+	my $backup_server = which_backup_host();
+	verbose "Connecting to backup host $backup_server:$backup_port\n";
+	my $socket = new IO::Socket::INET
+			PeerAddr => $backup_server,
+			PeerPort => $backup_port,
+			Proto => 'tcp' or die "Can't connect to $backup_server:$backup_port: $!";
+	binmode($socket, ':raw');
+
+	die "Can't connect: $!" unless $socket;
+	$_ = getstr($socket);
+	verbose "<-- $_\n";
+	print "Server won't accept backup:\n$_\n" and exit unless /^HELLO (.*)/;
+
+	foreach my $backup_dir (@filesystems)
+	{
+		next unless $backup_dir;
+		error("Won't backup \"$backup_dir\" - not an absolute pathname\n") and next unless $backup_dir =~ /^\//;
+		error("Won't backup \"$backup_dir\" - does not exist\n") and next unless -d $backup_dir;
+
+		# Stop tar whinging about removing leading /
+		my $dir = $backup_dir;
+		$dir =~ s?^/??;
+		chdir("/");
+		$dir = "." unless $dir;
+
+		message("Backing up $backup_dir\n");
+		my $cmd = "BACKUP $dir";
+		$cmd .= " encrypt=$encrypt" if $encrypt;
+		verbose "--> $cmd\n";
+		sendstr($socket, $cmd);
+		$_ = getstr($socket);
+		verbose "<-- $_\n";
+		error "Didn't receive OK to BACKUP: $_\n" and next unless /^OK (.*)$/;
+		my %args;
+		foreach (split / /, $1)
+		{
+			my($key, $value) = split /=/;
+			$args{$key} = $value;
+		}
+
+		my $last_backup;
+		if ($args{last})
+		{
+			error "Didn't receive last backup time in OK: $_" and last unless
+			$last_backup = strftime("%Y-%m-%d %H:%M:%S", localtime($args{last}));
+			message "Last backup of this directory was $last_backup\n";
+			message "This backup will be a level $args{level}\n";
+		}
+		else
+		{
+			message "This is the first backup for this directory\n";
+		}
+
+		$args{level} ||= 0;
+
+		# Build tar command line
+		my $options = "--one-file-system -S -G -p -c";
+		$options .= " --newer-mtime \"$last_backup\""
+			if $last_backup && $args{level};
+
+		my $tempfile = tmpnam();
+		my $cmdline = "tar $options -f - $dir 2>$tempfile";
+		$cmdline .= " | gzip -c" if $args{compress} eq 'gzip';
+		$cmdline .= " | bzip2 -c" if $args{compress} eq 'bzip2';
+		$cmdline .= " | gpg -e -r \"$encrypt\" --batch -" if $encrypt;
+		message "Running $cmdline\n";
+
+		open(TAR, "$cmdline|") or sendstr($socket, "0") and error("Won't backup \"$backup_dir\" - $1\n") and next;
+		binmode(TAR, ':raw');
+		my $buffer;
+		my $total = 0;
+		my $md5 = new Digest::MD5;
+		message "Beginning transfer\n";
+		my $error;
+		my $backup_start = time;
+		while (1)
+		{
+			my $n = sysread(TAR, $buffer, 256*1024);
+			last unless $n;
+			error("Error reading data from tar: $!") and $error = $1 and last if $n < 0;
+
+			sendstr($socket, $buffer) or
+				error("Error sending data to server: $!") and $error = $1 and last;
+
+			$total += $n;
+			$md5->add($buffer);
+		}
+		close(TAR);
+		sendstr($socket, "");
+
+		# Wait for the server to OK the backup
+		$_ = getstr($socket);
+		verbose "<-- $_\n";
+		if ($error)
+		{
+			# We had an error reading / sending data, don't bother trying the digest
+			verbose "--> NO backup incomplete: $error\n";
+			sendstr($socket, "NO backup incomplete: $error");
+		}
+		else
+		{
+			# Server wrote everything to disk, check that it all matches
+			my $digest = $md5->hexdigest;
+
+			if (/^OK (\d+) (\w+)$/)
+			{
+				if ($1 ne $total)
+				{
+					error("Data transfer error. Server only received $1 of $total bytes\n");
+					verbose "--> NO Incorrect total\n";
+					sendstr($socket, "NO Incorrect total");
+				}
+				elsif ($2 ne $digest)
+				{
+					error("Data transfer error. Checksum does not match on server end\n");
+					verbose "--> NO Invalid checksum\n";
+					sendstr($socket, "NO Invalid checksum");
+				}
+				else
+				{
+					message("Backup of $backup_dir successful\n");
+					verbose "--> OK\n";
+					sendstr($socket, "OK");
+					$total_bytes += $total;
+				}
+			}
+			elsif (/^NO (.*)/)
+			{
+				error("Server could not complete backup: $1\n");
+				verbose "--> NO $1\n";
+				sendstr($socket, "NO $1");
+			}
+			else
+			{
+				error("Received invalid response: $_\n");
+				verbose "--> NO $1\n";
+				sendstr($socket, "NO $_");
+			}
+		}
+
+		if (open(ERRORS, "<$tempfile"))
+		{
+			my @errors = grep !/(?:file changed as we read it|Cannot stat: No such file or directory|Error exit delayed from previous errors)/i, <ERRORS>;
+			close(ERRORS);
+			if (scalar(@errors))
+			{
+				error("Tar output:\n");
+				error(join("", @errors));
+			}
+		}
+
+		unlink($tempfile);
+
+		my $backup_end = time;
+		message(sprintf("Backed up $backup_dir: %0.1fMb in %d seconds (%0.1fKb/s)\n\n", ($total / 1024 / 1024),
+					($backup_end - $backup_start),
+					($total / 1024) / (($backup_end - $backup_start) || 1)));
+
+	}
+
+	verbose "--> BYE\n";
+	sendstr($socket, "BYE");
+	message(sprintf("\nBacked up: %0.1fMb in %d seconds (%0.1fKb/s)\n", ($total_bytes / 1024 / 1024),
+				(time - $program_start),
+				($total_bytes / 1024) / ((time - $program_start) || 1)));
+
+	print "Errors occurrecd during backup:\n\n" unless $perfectbackup;
+	print "$backup_errors\n\n-- \n$0\n" if !$perfectbackup || $report;
+	exit $perfectbackup ? 0 : 1;
+}
+#}}}
+else #{{{
+{
+	show_help();
+}
+#}}}
+
+
+sub sendstr
+{
+	my($socket, $str) = @_;
+#	print "--> $str\n";
+	my $tmp = pack("N", length($str));
+	syswrite($socket, $tmp, 4);
+	syswrite($socket, $str, length($str));
+}
+
+sub getstr
+{
+	my($socket) = @_;
+	my $tmp;
+	my $str;
+	doread($socket, \$tmp, 4);
+	doread($socket, \$str, unpack("N", $tmp));
+#	print "<-- $str\n";
+	return $str;
+}
+
+sub which_backup_host
+{
+	my $backup_host = $backup_servers->[0];
+	goto doreturn unless -f $last_backup_file;
+	open(F, $last_backup_file) || goto doreturn;
+	my $last_backup_server = <F>;
+	close(F);
+	chomp $last_backup_server;
+	for (my $i = 0; $i < scalar @$backup_servers; $i++)
+	{
+		if ($backup_servers->[$i] eq $last_backup_server)
+		{
+			$backup_host = $backup_servers->[$i+1] || $backup_servers->[0];
+			goto doreturn;
+		}
+	}
+
+	doreturn:
+	if (open(F, ">$last_backup_file"))
+	{
+		print F "$backup_host\n";
+		close(F);
+	}
+	return $backup_host;
+}
+
+sub doread
+{
+	my($socket, $buffer, $size) = @_;
+	return undef unless $size;
+	my $r = 0;
+	while ((my $b = sysread($socket, $$buffer, $size - $r, $r)) > 0)
+	{
+		$r += $b;
+		return $r if ($r >= $size);
+	}
+	return $r;
+}
+
+sub nice_size
+{
+	my($bytes) = @_;
+	return sprintf("%0.1f Tb", $bytes / (1024 * 1024 * 1024 * 1024)) if ($bytes >= 1024 * 1024 * 1024 * 1024);
+	return sprintf("%0.1f Gb", $bytes / (1024 * 1024 * 1024)) if ($bytes >= 1024 * 1024 * 1024);
+	return sprintf("%0.1f Mb", $bytes / (1024 * 1024)) if ($bytes >= 1024 * 1024);
+	return sprintf("%0.1f Kb", $bytes / (1024)) if ($bytes >= 1024);
+	return sprintf("%d bytes", $bytes);
+}
+
+sub show_help#{{{
+{
+	print <<EOF;
+Usage:
+	$0 <backup|restore|list> <options> path [path...]
+
+Global Options:
+	-v		Verbose
+	-s<hostname>	Backup Server hostname
+	-?		This help
+
+Backup Options:
+	-r		Show report every run, not just on error
+	-h<hostname>	My Hostname
+	-e<recipient>	Encrypt backups using GPG for the specified recipient
+
+Restore Options:
+	-h<hostname>	My Hostname
+	-a<key>		Specify authentication key to restore backups for the given host
+	-t		Dry run, don't produce any output
+	-0		Don't restore the level 0 backup first (dangerous)
+	-d<path>	Restore to the given path instead of the current directory
+	-b<run.level>	Restore a single backup file instead of a while run
+
+EOF
+
+	exit 0;
+}#}}}
+sub verbose($) #{{{
+{
+	my($message) = @_;
+	return unless $verbose;
+
+	if ($mode eq 'backup')
+	{
+		print $message;
+	}
+	else
+	{
+		if ($progress)
+		{
+			$progress->message($message);
+		}
+		else
+		{
+			print $message;
+		}
+	}
+}
+#}}}
+sub message($) #{{{
+{
+	my($message) = @_;
+
+	if ($mode eq 'backup')
+	{
+		if ($verbose)
+		{
+			print $message;
+		}
+		else
+		{
+			$backup_errors .= $message;
+		}
+	}
+	else
+	{
+		if ($progress)
+		{
+			$progress->message($message);
+		}
+		else
+		{
+			print $message;
+		}
+	}
+}
+#}}}
+sub error($) #{{{
+{
+	my($message) = @_;
+	if ($mode eq 'backup')
+	{
+		$perfectbackup = 0;
+		message("---- $message");
+	}
+	else
+	{
+		message($message);
+	}
+}
+#}}}
+
+__END__
+
+=head1 NAME
+
+dbackup - Disk-Based Backup Client
+
+=head1 SYNOPSIS
+
+dbackup backup [-vr] [-s server_hostname] [-e recipient] filesystem [filesystem ...]
+
+dbackup list [-v] [-s server_hostname] [-h my_hostname]
+
+dbackup restore [-vrt0] [-s server_hostname] [-h my_hostname] [-d output_dir] [-b run.level] filesystem [filesystem ...]
+
+=head1 DESCRIPTION
+
+This is the backup client for the dbackup software. It does backups, restores
+and lists. Generally this is run from C<cron(8)>, but you can run it from the
+command prompt if needed.
+
+The first parameter must be the mode to run in, one of either B<backup>,
+B<list> or B<restore>.
+
+=head1 BACKUP MODE
+
+This is the mode used to make a backup of a filesystem. You must specify at
+least one filesystem on the command line to be backed up, but you can specify
+as many as you like.
+
+Unless the B<-v> or B<-r> options are specified, output is only generated if
+there is an error in backup. This makes it great to run unattended from cron,
+as it won't send a mail unless there's an error.
+
+If B<-e> is specified, then the file will be gpg encrypted for B<recipient>
+before being sent across the network.
+
+The error output lists debugging information as well, and errors are prefixed
+with "---".
+
+The server is designed to handle all the smarts and maintain all state on the
+backups, whereas the client is supposed to be minimal. This aids a lot in the
+case of a complete system failure and needing to recover everything.
+
+The client-server protocol is described in the B<PROTOCOL> section of the
+dbackup_server file.
+
+=head1 LIST MODE
+
+This mode is used to find out what backups are available for a given client. By
+default it requests backups for the current system, but you can specify a
+hostname to request backups for using the B<-h> parameter.
+
+The list output will show one backup run per line, and will show all available
+backups, so the list could be very long.
+
+The B<Flags> column can contain one or more of the following:
+
+=over 4
+
+=item B<C>
+
+This backup run is compressed, with with gzip or bzip2.
+
+=item B<E>
+
+This backup run is encrypted. You must have the private key available to
+decrypt the backup.
+
+=back
+
+=head1 RESTORE MODE
+
+This mode is used to retrieve backup files and extract them to the local
+machine. You must specify at least one filesystme to restore on the command
+line.
+
+By default it requests backups for the current system, but you can specify a
+hostname to request backups for using the B<-h> parameter.
+
+Dbackup is designed to be simple and fast to use, so the default for restore is
+to retrieve all the parts of the latest backup run. It will start off with
+level 0 (full backup). If the server is configured to do full incrementals, it
+will also retrieve the latest non-zero run. If the server does daily
+incrementals, all subsequent levels will be retrieved in order.
+
+You can specify an invidual file to retrieve using the B<-b> flag. You must
+specify the file as B<run>.B<level>. The level increases by one each backup
+until the configured number of incrementals is reached, then the next backup is
+a full backup with the next run number.
+
+As the data is retrieved from the server it is extracted on the fly. The
+default is to extract to the current directory, but this can be changed with
+the B<-d> argument.
+
+The restore also supports basic authentication using the B<-a> flag to specify
+the key required by the server. The B<dbackup_server> documentation contains
+more information on this feature.
+
+=head1 ENCRYPTION
+
+You can encrypt a backup from prying eyes by using the -e flag. Before you run
+this backup, make sure you have generated a key for root, have added the
+recipient's key to root's keyring, and signed the recipient's key with root's
+key:
+
+client:~# gpg --gen-key
+
+client:~# gpg --recv-keys 0x12345678
+
+client:~# gpg --sign-key 0x12345678
+
+=head1 AUTHOR
+
+David Parrish <david-dbackup@dparrish.com>
+
+=head1 SEE ALSO
+
+C<dbackup_server(8)>
+
+=cut
+

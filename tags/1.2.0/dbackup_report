@@ -1,0 +1,217 @@
+#!/usr/bin/perl -w
+# vim:sw=8 ts=8 cindent autoindent
+
+use strict;
+use Socket;
+use POSIX qw( isatty strftime );
+use Digest::MD5 qw( md5_hex );
+use Fcntl qw( :flock );
+use File::Find;
+
+# Initialisation stuff here
+use vars qw( $config );
+for my $conf ("/etc/dbackup/config", "/etc/dbackup_config") {
+	if (-f $conf) {
+		require $conf;
+		last;
+	}
+}
+
+my $start_time = ((stat("/var/state/dbackup/last_report"))[9]) || 0;
+
+my $st = strftime("%Y-%m-%d %H:%M", localtime($start_time));
+my $et = strftime("%Y-%m-%d %H:%M", localtime(time()));
+my $period = sprintf("%d", (time() - $start_time) / 60 / 60); # Period in hours
+
+my %stats = (
+	dirs => 0,
+	buhosts => {},
+	hosts => {},
+	total_size => 0,
+	free_space => 0,
+
+	full_size => 0,
+	full_dirs => 0,
+
+	inc_size => 0,
+	inc_dirs => 0,
+);
+
+if (open(DF, "df -kP $config->{backup_root} |")) {
+	while (<DF>) {
+		chomp;
+		my($drive, $total, $used, $free, $perc, $fs) = split(/\s+/);
+		next unless ($free =~ /^\d+$/);
+		$stats{free_space} = $free * 1024;
+	}
+	close(DF);
+}
+
+opendir(HOSTS, $config->{backup_root}) or die "Can't open $config->{backup_root}: $!";
+foreach my $host (readdir(HOSTS)) {
+	next if $host =~ /^\.\.?$/;
+	$stats{hosts}->{$host} = {
+		dirs => 0,
+		total_size => 0,
+		full_size => 0,
+		full_dirs => 0,
+		inc_size => 0,
+		inc_dirs => 0,
+
+		full_backups => 0,
+		all_size => 0,
+		oldest => 0,
+	};
+	opendir(FILES, "$config->{backup_root}/$host") or die "Can't open $config->{backup_root}/$host: $!";
+	foreach (readdir(FILES)) {
+		next unless /^([\w\.\-_]+)\.(\d+)\.(\d+)\.(.*)\.meta$/;
+		open(FH, "<$config->{backup_root}/$host/$_") or
+			print("Can't read $config->{backup_root}/$host/$_: $!") and next;
+		my %args;
+		while (<FH>)
+		{
+			chomp;
+			my($key, $value) = split /=/;
+			$args{$key} = $value;
+		}
+		close(FH);
+
+		$stats{grand_size} += $args{size};
+		$stats{hosts}->{$host}{all_size} += $args{size};
+		$stats{hosts}->{$host}{full_backups}++ if $3 == 0;
+		$stats{hosts}->{$host}{oldest} = $args{start_time}
+			if ($stats{hosts}->{$host}{oldest} == 0 || $stats{hosts}->{$host}{oldest} > $args{start_time});
+
+		next if $args{start_time} < $start_time;
+
+		$stats{buhosts}->{$host}++;
+		$stats{hosts}->{$host}{dirs}++;
+		$stats{dirs}++;
+
+		$stats{hosts}->{$host}{total_size} += $args{size};
+		$stats{total_size} += $args{size};
+		if ($args{level} == 0) {
+			$stats{full_size} += $args{size};
+			$stats{full_dirs}++;
+			$stats{hosts}->{$host}{full_size} += $args{size};
+			$stats{hosts}->{$host}{full_dirs}++;
+		} else {
+			$stats{inc_size} += $args{size};
+			$stats{inc_dirs}++;
+			$stats{hosts}->{$host}{inc_size} += $args{size};
+			$stats{hosts}->{$host}{inc_dirs}++;
+		}
+	}
+}
+
+my $numhosts = scalar keys %{$stats{buhosts}};
+my $total_mb = nice_size($stats{total_size});
+my $full_mb = nice_size($stats{full_size});
+my $inc_mb = nice_size($stats{inc_size});
+my $grand_mb = nice_size($stats{grand_size});
+my $free_mb = nice_size($stats{free_space});
+print <<EOF;
+----------------- dbackup report -------------------
+
+Backup statistics for the last $period hour period:
+(Between $st and $et)
+
+Number of hosts backed up:		$numhosts
+Number of filesystems backed up:	$stats{dirs}
+Size of this backup:			$total_mb
+Total size of all backups:		$grand_mb
+Free space on dump filesystem:		$free_mb
+
+EOF
+
+if ($stats{full_size}) {
+	print <<EOF;
+Full Backups:
+Filesystems:				$stats{full_dirs}
+Total size:				$full_mb
+
+EOF
+} else {
+	print "There were no full backups performed.\n\n";
+}
+
+if ($stats{inc_size}) {
+	print <<EOF;
+Incremental Backups:
+Filesystems:				$stats{inc_dirs}
+Total size:				$inc_mb
+
+EOF
+} else {
+	print "There were no incremental backups performed.\n\n";
+}
+
+print "Per Host statistics:\n";
+foreach my $host (keys %{$stats{hosts}}) {
+	next unless $stats{hosts}->{$host}{dirs};
+	print "\n$host\n";
+	printf("  Filesystems backed up:	$stats{hosts}->{$host}{dirs}\n");
+	printf("  Size of this backup:		%s\n", nice_size($stats{hosts}->{$host}{total_size}));
+	if ($stats{hosts}->{$host}{full_dirs}) {
+		printf("  Full Filesystems:		$stats{hosts}->{$host}{full_dirs}\n");
+		printf("  Full Size:			%s\n", nice_size($stats{hosts}->{$host}{full_size}));
+	}
+	if ($stats{hosts}->{$host}{inc_dirs}) {
+		printf("  Incremental Filesystems:	$stats{hosts}->{$host}{inc_dirs}\n");
+		printf("  Incremental Size:		%s\n", nice_size($stats{hosts}->{$host}{inc_size}));
+	}
+	print "  Total backup runs available:	$stats{hosts}->{$host}{full_backups}\n";
+	printf("  Total size of all backups:	%s\n", nice_size($stats{hosts}->{$host}{all_size}));
+	printf("  Average backup size:		%s\n",
+			nice_size($stats{hosts}->{$host}{all_size} / $stats{hosts}->{$host}{full_backups}));
+	printf("  Oldest backup available:	%s\n",
+			strftime("%Y-%m-%d %H:%M", localtime($stats{hosts}->{$host}{oldest})));
+}
+
+print "\n\n";
+
+print "Sizes:\n";
+printf("%-20s%s\n", $_, nice_size($stats{hosts}->{$_}{all_size}))
+	foreach (sort { $stats{hosts}->{$b}{all_size} <=> $stats{hosts}->{$a}{all_size} } keys %{$stats{hosts}});
+
+print "\n\n-- \n$0\n";
+
+mkdir "/var/state" unless -d "/var/state";
+mkdir "/var/state/dbackup" unless -d "/var/state/dbackup";
+open(FH, ">/var/state/dbackup/last_report") || close(FH);
+
+exit;
+
+sub nice_size
+{
+	my($bytes) = shift() || 0;
+	return sprintf("%0.2f Tb", $bytes / (1024 * 1024 * 1024 * 1024)) if ($bytes >= 1024 * 1024 * 1024 * 1024);
+	return sprintf("%0.2f Gb", $bytes / (1024 * 1024 * 1024)) if ($bytes >= 1024 * 1024 * 1024);
+	return sprintf("%0.2f Mb", $bytes / (1024 * 1024)) if ($bytes >= 1024 * 1024);
+	return sprintf("%0.2f Kb", $bytes / (1024)) if ($bytes >= 1024);
+	return sprintf("%d bytes", $bytes);
+}
+
+=head1 NAME
+
+dbackup_report - Disk-Based Backup Report
+
+=head1 SYNOPSIS
+
+dbackup_report
+
+=head1 DESCRIPTION
+
+This process creates a text report on the current state of the dbackup archive.
+This is meant to be run daily or weekly on the dbackup server by C<cron(8)> or
+similar.
+
+=head1 AUTHOR
+
+David Parrish <david@dparrish.com>
+
+=head1 SEE ALSO
+
+C<dbackup(1)>
+
+=cut
