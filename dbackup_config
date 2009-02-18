@@ -1,0 +1,55 @@
+# dbackup server configuration
+# This is the global configuration file.
+# Any of these options can also be specified per host
+# vim: ft=perl
+
+
+# Backups will be stored here
+# Probably not a good idea to set this per client.
+$config->{backup_root} = "/home/dbackup/dumps";
+
+# Change this to 1 to enable verbose logging
+$config->{verbose} = 1;
+
+# Logging will be written to this file
+$config->{logfile} = "/var/log/dbackup_server.log";
+
+# stderr output will go to this file
+$config->{stderr_file} = "";
+
+# Number of incremental backups between full backups
+$config->{num_incrementals} = 7;
+
+# After this, backups will be archived to tape and deleted. Set to 0 to disable
+$config->{archive_days} = 21;
+$config->{delete_days} = 21;
+
+# Set to gzip/bzip2/0 to enable/disable server compression of backups. Slows down backup a *lot*
+$config->{compress} = 0;
+
+# Set to a list of IP addresses to allow backups from (empty to disable)
+# Example:
+$config->{ip_allow} = [
+    '127\.0\.0\.1',
+    '192\.168\.[01]\.',
+    '10\.0\.[01]\.',
+];
+
+# Authentication key
+# Systems must provide this key (if set) to restore backups
+$config->{auth_key} = "";
+
+# If an incremental backup is above this threshold, force a full backup
+# next time
+$config->{full_backup_threshold} = 50;
+
+# Do incrementals from the full backup or from the last incremental
+$config->{full_incremental} = 0;
+
+# If set, the full backup will be invalidated if any of the backup set is broken
+$config->{invalidate_fullbackups} = 0;
+
+# Set this to a domain name regex you would like to strip off hostnames
+$config->{domain_name_strip} = qr/(\.mydomain\.com|\.otherdomain\.com\.au)$/;
+
+1;
